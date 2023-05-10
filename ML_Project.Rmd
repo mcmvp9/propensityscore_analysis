@@ -1,0 +1,448 @@
+---
+title: "The Impact of Health Insurance on Hospital Stay Duration: A Propensity Score Analysis using Machine Learning          Algorithms (Logistic Regression & LASSO)"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+author: "Melvin Coleman"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(caret)
+library(modelr)
+library(glmnet)
+library(MatchIt)
+library(randomForest)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+
+set.seed(123)
+
+knitr::opts_chunk$set(
+	echo = TRUE,
+	warning = FALSE,
+  fig.width = 6,
+  fig.asp = .6,
+  out.width = "90%"
+)
+theme_set(theme_minimal() + theme(legend.position = "bottom"))
+options(
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis"
+)
+scale_colour_discrete = scale_colour_viridis_d
+scale_fill_discrete = scale_fill_viridis_d
+```
+
+### Background 
+
+Health insurance is one of many barriers to health care coverage and can influence health outcomes tremendously. There are over 27 million people living in the United States who don’t have health insurance and make up mostly non-elderly populations, from working families, low income families and most likely to be people of color, six in ten to be exact. (Key Facts About the Uninsured Population, 2023).
+
+Length of hospital stay has been previously used as a marker to measure quality of care and resource utilization (Englum et al., 2016). Previous studies have shown that uninsured patients have increased worse outcomes and decreased length of  hospital stay which may be a contributing factor (Englum et al., 2016). In this study. I will explore the SPARCS 2015 In-patient Hospital Discharges data to explore the association between length of hospital stay and health insurance status among adults 18 -29 years. 
+
+### Research Question 
+Among adults 18 - 29 years hospitalized in the United States in 2015, what is the effect of health insurance status on the duration of their hospital stay? <br>
+
+To answer the research question above, we will conduct a propensity score analysis utilizing machine learning algorithms. 
+Specifically, we will examine and compare logistic regression and Lasso to construct the propensity scores.
+After constructing the propensity score and matching to obtain comparable groups, we will assess their performance by comparing the distributions of covariates between the exposed and unexposed groups. Following this, we will create a logistic regression model to examine the effect of insurance status on length of hospital stay using the propensity scores model from the two algorithms described above. 
+
+### Data  Description
+
+We will examine data from New York State's Statewide Planning and Research Cooperative System (SPARCS) 2015 Inpatient
+Discharges De-identified data set. The de-identified data contains "basic record leve detail" for patient discharge and does not contain protected health information (PHI) under HIPAA. There are 2,346,931 observations in this data set.  <br>
+You can access the data here [2015 Inpatient Discharges (SPARCS De-Identified): 2015](https://health.data.ny.gov/Health/Hospital-Inpatient-Discharges-SPARCS-De-Identified/82xm-y6g8) for more 
+information. <br>
+
+The variables of interest in this study include:
+   
+- `gender`: Patient's gender characterized as Male(M), Female(F) <br>
+
+- `race` : Patient's race reported as Black/African American, Multi, Other Race, Unknown, White <br>
+           Other Race includes Native Americans and Asian/ Pacific Islander. <br>
+
+- `length of stay` : The total number of patient days at an acute level and/or other than acute care level <br>
+                     (excluding leave of absence days) (Discharge Date - Admission Date) + 1. Length of Stay <br>
+                     greater than or equal to 120 days has been aggregated to 120+ days. <br> 
+                     
+- `type of admission`: A description of the manner in which the patient was admitted to the health care facility: <br>
+                       Elective, Emergency, Newborn, Not Available, Trauma, Urgent. <br>
+
+- `patient disposition`: The patient's destination or status upon discharge. <br>
+
+- `APR Severity of Illness Description`: All Patient Refined Severity of Illness (APR SOI) Description. <br>
+                                          Minor (1), Moderate (2), Major (3) , Extreme (4). <br>
+                                          
+- `APR Medical Surgical Description` :  The APR-DRG specific classification of Medical, Surgical or Not Applicable..
+
+- `APR Risk of Mortality`: All Patient Refined Risk of Mortality (APR ROM). Minor (1), Moderate (2), Major (3) , Extreme (4). <br>
+
+- `Payment Typology 1`: A description of the type of payment or health insurance payment for healthcare procedure.<br>
+
+- `Total Charges`: Total charges for the healthcare procedure <br>
+ 
+\newpage
+
+***
+### Analytic Pipeline 
+
+Because we are conducting a propensity analysis, we will create propensity scores focusing
+on the confounders of interest and exposure (`health insurance status`), not the outcome. 
+
+The following confounders of interest were hypothesized to be associated with 
+length of hospital stay and/or health insurance status(exposure) in this study : <br>
+race, gender, admission type, patient disposition, severity of illness, surgical or medical procedure,<br>
+risk of mortality, and health care procedure costs. 
+
+We will use these confounders to create exchangeable groups, i.e propensity scores. 
+
+The exposure of interest (health_insurance_status) was categorized as binary: <br>
+a) Uninsured : subjects with insurance payment types "Self-Pay", "Miscellaneous/Other", "Unknown" or missing data <br>
+b) Insured: subjects with any other insurance types including government, public or private. <br>
+
+The outcome of interest (length of hospital stay) was caetgorized as binary based on the median hospital stay in the data: <br>
+a) &gt;3 days : subjects with more than 3 days at a hospital <br>
+b) &le;3 days : subjects with 3 days or less stay at a hospital <br>
+
+*** We conducted a complete case analysis, omitting all missing observations!
+
+### Import Data & Perform Manipulations
+
+```{r}
+pt_discharges <- 
+    read_csv("data/Hospital_Inpatient_Discharges__SPARCS_De-Identified___2015.csv", col_names = TRUE) %>% 
+            janitor::clean_names() %>% 
+  
+        #Restrict to only variables of interest
+select(age_group, gender, race, type_of_admission, patient_disposition, 
+       apr_medical_surgical_description, apr_severity_of_illness_description, apr_risk_of_mortality, 
+       payment_typology_1, length_of_stay, total_charges) %>% 
+  
+    #Change variable types
+mutate(
+  across(c("age_group", "gender", "race", "apr_medical_surgical_description", "type_of_admission", 
+            "patient_disposition", "apr_severity_of_illness_description", "apr_risk_of_mortality", 
+             "payment_typology_1"), as.factor),
+      length_of_stay = as.numeric(length_of_stay))
+  
+# Quick look at dataset  (and examine some characteristics before proceeding to creating final dataset)
+glimpse(pt_discharges)
+
+```
+
+Next, let's perform some manipulations to ensure we can create suitable dataset to answer our research question. 
+
+We will first create a new variable called `health_insurance_status` based on `payment_typology_1` in the `patient_discharges` data set. `health_insurance_status` will be categorized into 2 categories: <br>
+- "insured" : consisting of any type of insurance (medicare,private health insurnance, Blue Cross/Blue Shield, etc...) <br>
+- "uninsured" : consisting of individuals who self-payed, unknown, insurance type, miscellaneous/other, or missing. <br>
+
+We also create a new variable called `hosp_stay` based on `length of stay`, our outcome of interest. 
+Justification for the cutoff is based on median hospital stay (3 days), with a right_skewed distribution.
+
+```{r}
+#plot of length of stay among population of interest
+pt_discharges %>% 
+  filter(age_group %in% c("18 to 29")) %>% 
+  ggplot(aes(x = length_of_stay)) + geom_histogram(binwidth = 1, color = "black", fill = "lightblue") +
+  labs(x = "Length of Hospital Stay") +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10)) + 
+  ggtitle("Histogram of Length of Hospital Stay Distribution Among Patients 18 to 29 years old")
+      
+```
+
+Next, we will remove all missing values from this dataset including all `NAs` because we will be completing a complete case analysis. We will remove all those with `unknown` gender types and restrict our population to age groups &ge;18. 
+Subjects with patient dispositions of home/self care, left against medical advice and home w/ health services were 
+the only patient dispositions included in this analysis. We felt these 3 were most prominent and logically contribute 
+to the outcome of interest. 
+
+```{r}
+final_discharges <- 
+  pt_discharges %>% 
+ #remove unknown gender & restrict to age groups &ge;18
+  filter(!gender %in% c("U"), 
+         !age_group %in% c("0 to 17","30 to 49", "50 to 69", "70 or Older"),
+         !apr_medical_surgical_description %in% c("Not Applicable"),
+         patient_disposition %in% c("Home or Self Care", 
+                                    "Left Against Medical Advice",
+                                    "Home w/ Home Health Services"),
+         !is.na(length_of_stay)) %>% 
+  
+  #Perform manipulations for new dataset
+  mutate(
+    across(c("gender", "age_group", "apr_medical_surgical_description", "patient_disposition"), droplevels), 
+  
+  #Create new variable length of stay (based on median value)
+   hosp_stay = if_else( length_of_stay >3, "Greater than 3 days", "Less than/ equal to 3 days"),
+   hosp_stay = as.factor(hosp_stay),
+    
+  #Create new variable (health insurance)
+    health_insurance_status = if_else(
+          payment_typology_1 %in% c("Self-Pay", "Miscellaneous/Other", "Unknown", ""), "Uninsured", "Insured"),
+   health_insurance_status = as.factor(health_insurance_status), 
+    
+    type_of_admission = if_else(
+         type_of_admission %in% c("Not Available"), "Other", 
+           #small number of newborns so added to other category 
+            if_else(type_of_admission %in% c("Newborn"), "Other", type_of_admission)), 
+
+    type_of_admission = as.factor(type_of_admission)
+    ) %>% 
+select(-payment_typology_1, -length_of_stay, -age_group)
+  
+#remove all missing values 
+na.omit(final_discharges) 
+
+#quick look at dataset
+glimpse(final_discharges)
+```
+
+
+Our final data set `final_discharges` consists of 236,698 observations and 10 variables.
+The graphs & tables below show some characteristics of our study population.
+
+```{r }
+final_discharges %>% 
+  ggplot(aes(x=health_insurance_status, fill = gender)) + 
+  geom_bar(position = "dodge", alpha = 0.8, color = "black") +
+  scale_fill_manual(values = c("#FFD700", "#2F4F4F")) +
+  ggtitle("Distribution of Health Insurance status by Gender") +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        axis.title.x = element_text(size = 12, face = "bold"),
+        axis.title.y = element_text(size = 12, face = "bold"),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 10)) +
+
+    ggtitle("Distribution of Health Insurance status by Gender")
+
+
+final_discharges %>% 
+  ggplot(aes(x=health_insurance_status, fill = race)) + 
+  geom_bar(position = "dodge", alpha = 0.8, color = "black") +
+  scale_fill_manual(values = c("#FFD700", "#2F4F4F", "#007FFF", "#F08080")) +
+  ggtitle("Distribution of Health Insurance Status by Race") +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        axis.title.x = element_text(size = 12, face = "bold"),
+        axis.title.y = element_text(size = 12, face = "bold"),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 10)) +
+
+    ggtitle("Distribution of Health Insurance status by Race")
+
+
+
+```
+
+From the plots, we can see some disparities that exist between insurance status and race as well as gender. 
+Among insured patients in our population, the majority are more likely to be women. However, there didn't 
+appear to be any major difference in the proportion of individuals uninsured between populations. 
+More people identifying as "White" had high proportions of being uninsured and insured. 
+
+The table below provides more information about the makeup of our study's population.
+
+```{r}
+final_discharges %>% 
+  na.omit() %>%
+  summary() %>%
+  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+Now that we've created our final data set for this analysis, let's begin our analysis.
+
+\newpage
+
+### Estimate Propensity Score Algorithm Using the Logistic Regression Algorithm 
+
+Logistic regression is a common method that has been used widely to create propensity 
+scores. We will first begin creating propensity scores using the logistic regression algorithm. 
+First,, we create a logistic regression model with our exposure of interest, health
+insurance status as the outcome in the model and create propensity scores, the predicted 
+probability of health insurance status.
+
+```{r}
+set.seed(123)
+
+#logistic regression model (confounders & health insurance status)
+ps_logit_mdl <- 
+      glm(health_insurance_status ~ gender + race + type_of_admission + patient_disposition +
+            apr_medical_surgical_description + apr_severity_of_illness_description + 
+            apr_risk_of_mortality + total_charges,
+   data = final_discharges, family = binomial(link = "logit"))
+    
+    #estimate odds  of health insurance and convert to probability
+    logit_prop_score <-  predict(ps_logit_mdl, final_discharges, type = "response")
+    
+    # the logistic regression estimated PS
+    final_discharges$ps_logit <- logit_prop_score 
+```
+### Estimate Propensity Score Using Lasso 
+
+We chose to use the Lasso to create propensity scores due to the ability of 
+this algorithm to handle large datasets, account for correlations, and penalize features 
+that aren't important predictors. This model may improve accuracy and provide great precision 
+of propensity score estimates. We created a sequence of numbers for our hyperparameter, lambda for tuning and kept
+alpha as 1 since this a Lasso algorithm. A grid for lambda was created to ensure best tuninig. We down sampled due to imbalance between health insurance status in our data. No cross validation was conducted because we have large data set and we're soley focused on creating propensity scores to ensure exchangeability.
+
+```{r}
+set.seed(123)
+
+#Control settings 
+control_settings <- trainControl(sampling = "down", classProbs = TRUE)
+
+#Create grid to search alpha & lambda
+grid <- expand.grid(alpha = 1,
+                   lambda = 10^seq(-3,3, length=100))
+
+#Lasso model (confounders & health insurance status)
+ps_lasso_mdl <- 
+   train(
+   health_insurance_status ~ gender + race + type_of_admission + patient_disposition +
+           apr_medical_surgical_description + apr_severity_of_illness_description + 
+            apr_risk_of_mortality + total_charges, 
+       data = final_discharges,
+              method = "glmnet", 
+              metric = "Accuracy",
+              tuneGrid = grid,
+              trControl = control_settings)
+
+  
+#Predicted probability of health insurance status
+lasso_prop_score <- predict(ps_lasso_mdl, final_discharges, type = "prob")[,2] 
+
+final_discharges$ps_lasso <-lasso_prop_score
+
+```
+Let's compare the propensity scores generated by each model above. 
+
+```{r}
+plot(final_discharges$ps_logit, final_discharges$ps_lasso)
+```
+From the plot above, we can see that there is tremendous overlap in the propensity score values.This suggest that both of these algorithms generated similar propensity scores. However, it's important to note that we do see some differences and variations between the scores for each algorithm. We will proceed further and examine the regions of common support in each model for matching. 
+
+### Examine Region of Common Support 
+
+
+```{r}
+
+#Logistic Regression Propensity Scores
+ggplot(data = final_discharges, aes(x = ps_logit)) +
+  geom_histogram(binwidth = 0.05, color = "black", fill = "lightblue") +
+  facet_grid(~ health_insurance_status) +
+  theme_bw() +
+  ggtitle("Overlap Propensity Scores from Logistic Regression") +
+  xlab("Propensity Score") +
+  ylab("Frequency")
+
+#Lasso Propensity Scores
+ggplot(data= final_discharges, aes(x=ps_lasso)) + 
+ geom_histogram(binwidth = 0.05, color = "black", fill = "lightblue") +
+  facet_grid(~ health_insurance_status) +
+  theme_bw() +
+  ggtitle("Overlap Propensity Scores from LASSO") +
+  xlab("Propensity Score") +
+  ylab("Frequency")
+
+```
+ From the histograms above, we can see that between the two groups, uninsured and insured for each algorithm, 
+ the histograms look pretty similar despite the small number of individuals for uninsured patients. This suggest that the based on the propensity scores generated, the two groups are really similar and accounted for the confounders mentioned above. The logistics regression algorithm generated propensity scores that accounted for mostly individuals at the lower end of the scale compared to the LASSO algorithm that generated scores all across the scale. Nevertheless, these histograms suggest that our propensity scores generated for insured vs uninsured individuals in this population are similar.
+ 
+Now, let's perform matching using the `MatchIt` package. We match insured and uninsured patients in a 1:2 ratio, 
+where for every 2 uninsured patients, 1 insured patient will be matched. We do this due to the imbalance between 
+insured and uninsured patients in our data. We discard subjects if there is no match in propensity scores. 
+ 
+```{r}
+
+ nn1 <- matchit(health_insurance_status ~ gender + race + type_of_admission + patient_disposition +
+            apr_medical_surgical_description + apr_severity_of_illness_description + 
+            apr_risk_of_mortality + total_charges, 
+        
+       data=final_discharges, distance= final_discharges$ps_logit, 
+                              method="nearest", 
+                            discard="both", 
+                          caliper = 0.2, 
+                        ratio = 2)
+
+ nn1_data <- match.data(nn1)
+
+#Lasso model
+nn1_lasso <- matchit(health_insurance_status ~ gender + race + type_of_admission + patient_disposition +
+            apr_medical_surgical_description + apr_severity_of_illness_description + 
+            apr_risk_of_mortality + total_charges, 
+        
+       data=final_discharges, distance= final_discharges$ps_lasso, 
+                              method="nearest", 
+                            discard="both", 
+                          caliper = 0.2, 
+                        ratio = 2)
+    
+    nn1_data_lasso <- match.data(nn1_lasso)
+    
+    #Average Standardized Mean Difference-Unmatched
+    mean(abs(summary(nn1, standardize=T)$sum.all[, 3][-1])) 
+    
+    # Matching attempt Logistic Regression
+    mean(abs(summary(nn1, standardize=T)$sum.matched[, 3][-1])) 
+
+    # Matching attempt LASSO
+    mean(abs(summary(nn1_lasso, standardize=T)$sum.matched[, 3][-1])) 
+```
+ 
+By examining the results above from the standardized mean differences, we can see that when we didn't match, the 
+average difference between features was 0.13. However, when we match using logistic regression and lasso, we can see that those differences reduce tremendously. The logistic regression model appears to have a slightly better matching compared to the LASSO.
+ 
+### Estimate and compare effects across algorithms
+ 
+```{r}
+#Logistic regression model
+outcome_mdl1 <- glm(hosp_stay ~ health_insurance_status, 
+                        data = nn1_data, 
+                        family = binomial(link = "logit"))
+                        
+    exp(outcome_mdl1$coefficients)
+        exp(confint(outcome_mdl1))
+  
+#Lasso model
+    outcome_mdl2 <- glm(hosp_stay ~ health_insurance_status, 
+                        data = nn1_data_lasso, 
+                        family = binomial(link = "logit"))
+    
+
+        exp(outcome_mdl2$coefficients)
+            exp(confint(outcome_mdl2))
+```
+
+### Interpretations/ Results
+
+We generated propensity scores and ensured that we  had an exchangeable popualtion of insured and uninsured individuals. Therefore, any differences we see between the groups can be attributed to the effect of insurance status on length of hospital stay. <br>
+
+From the logistic regression, the odds of having a duration of hospital stay longer than 3 days among uninsured patients was 1.2 times higher compared to insured patients (95% CI: 1.2 - 1.3). These results were significant suggesting that uninsured patients had longer hospital stays compared to insured patients.
+
+From the LASSO, the odds of having a duration of hospital stay longer than 3 days among uninsured patients was 1.3 times higher compared to insured patients (95% CI: 1.3- 1.4). These results were also significant.
+
+
+Both LASSO and Logistic regression algorithms produced very similar results. In conclusion, by performing a propensity analysis, we ensured that insured and uninsured patients were exchangeable and by examining the effect of insurance status on hospital length of stay, we concluded that insured patients were more likely to have less longer hospital stays compared to insured patients. This may be due to a number of factors including poor health outcomes for uninsured patients. However, further research may need to be conducted to confirm this suspicion.
+
+### Limitations & Ethical considerations 
+
+This study has several limitations. The first limitation is that we may not have accounted for other variables associated with both hospital length of stay (outcome) and health insurance status (exposure), our confounders or soley associated with the outcome. Therefore, the results we obtained could be biased. In addition, we didn't account for correlations between different hospitals or regions included in this data due to computational reasons with running our model. Accounting for correlations may be useful and could help determine the significance of the results obtained. 
+
+A ethical consideration to keep in mind is how these results may be utilized in the real world. Although, the results obtained suggest that here that uninsured patients have longer stays in hospital compared to insured patients, it's important to consider how we can address this issue. In addition, the algorithms used here pose a risk of bias and more research needs to be done to ensure these results are validated. Furthermore, these results should not be used to victimize or target a specific group. 
+
+### References 
+
+1. Key Facts about the Uninsured Population. (2023, February 7). KFF.         https://www.kff.org/uninsured/issue-brief/key-facts-about-the-uninsured-population/#:~:text=The%20number%20of%20uninsured%20individuals,to%2027.5%20million%20in%202021.
+
+2. Englum, B. R., Hui, X., Zogg, C. K., Chaudhary, M. A., Villegas, C. V., Bolorunduro, O., Stevens, K. A., Haut, E. R., Cornwell, E. E., Efron, D. T., & Haider, A. H. (2016). Association between Insurance Status and Hospital Length of Stay following Trauma. American Surgeon, 82(3), 281–288. https://doi.org/10.1177/000313481608200324
+
